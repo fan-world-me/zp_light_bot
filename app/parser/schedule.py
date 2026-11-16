@@ -67,9 +67,16 @@ def _parse_block(title: str, body: str) -> "Schedule | None":
 async def fetch_schedules() -> tuple["Schedule | None", "Schedule | None"]:
     """Return (today_schedule, tomorrow_schedule). Either can be None."""
     async with httpx.AsyncClient(
-        headers={"User-Agent": "Mozilla/5.0 (compatible; zp-light-bot/1.0)"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        },
         follow_redirects=True,
-        timeout=15,
+        timeout=20,
     ) as client:
         resp = await client.get(URL)
         resp.raise_for_status()
