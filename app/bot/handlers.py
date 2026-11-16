@@ -28,7 +28,8 @@ ABOUT_TEXT = (
     '🌐 <a href="https://fan-world-me.github.io/">Сайт автора</a>\n'
     '💻 <a href="https://github.com/fan-world-me">GitHub профіль</a>\n'
     '📦 <a href="https://github.com/fan-world-me/zp_light_bot">Репозиторій бота</a>\n\n'
-    'Дані: <a href="https://www.zoe.com.ua/outage/">zoe.com.ua</a>\n\n'
+    'Дані: <a href="https://www.zoe.com.ua/outage/">zoe.com.ua</a> (дзеркало '
+    '<a href="https://github.com/yaroslav2901/OE_OUTAGE_DATA">OE_OUTAGE_DATA</a>)\n\n'
     "📄 Ліцензія: GPL-3.0"
 )
 
@@ -151,6 +152,40 @@ async def cb_status_all(cb: CallbackQuery) -> None:
         reply_markup=main_menu(),
         parse_mode="HTML",
     )
+
+
+# ── на завтра ────────────────────────────────────────────────────────────────
+async def _send_tomorrow(cb: CallbackQuery, queue_ids: list[str] | None) -> None:
+    try:
+        _, tomorrow = await fetch_schedules()
+    except Exception:
+        log.error("status_tomorrow fetch error", exc_info=True)
+        await cb.message.answer(
+            "❌ Не вдалося отримати графік. Спробуй пізніше.",
+            reply_markup=main_menu(), parse_mode="HTML",
+        )
+        return
+
+    if not tomorrow:
+        await cb.message.answer(
+            "🌙 Графік на завтра ще не опублікований.\n"
+            "Оператор зазвичай публікує його ввечері.",
+            reply_markup=main_menu(), parse_mode="HTML",
+        )
+        return
+
+    await cb.message.answer(
+        format_schedule(tomorrow, queue_ids),
+        reply_markup=main_menu(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "status_tomorrow")
+async def cb_status_tomorrow(cb: CallbackQuery) -> None:
+    await _answer(cb)
+    user = await _get_or_create(cb.message.chat.id)
+    await _send_tomorrow(cb, user["queues"] or None)
 
 
 @router.callback_query(F.data == "settings")

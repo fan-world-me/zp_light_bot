@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from aiogram import Bot
+from aiogram.exceptions import TelegramRetryAfter
 
 from app.db.database import get_all_users, get_schedule_state, set_schedule_state
 from app.parser.schedule import fetch_schedules, format_schedule
@@ -8,7 +9,7 @@ from app.bot.keyboards import main_menu
 
 log = logging.getLogger(__name__)
 
-SEND_DELAY = 0.035
+SEND_DELAY = 0.05  # ~20 msg/s — с запасом до лимита Telegram в 30 msg/s
 _FETCH_RETRIES = 3
 _FETCH_RETRY_DELAY = 10  # seconds between retries
 
@@ -29,16 +30,26 @@ async def _fetch_with_retry():
 
 
 async def _send_safe(bot: Bot, chat_id: int, text: str) -> None:
-    try:
-        await bot.send_message(
-            chat_id,
-            text,
-            parse_mode="HTML",
-            reply_markup=main_menu(),
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        log.error("send_message failed for %s: %s", chat_id, e)
+    for attempt in range(2):
+        try:
+            await bot.send_message(
+                chat_id,
+                text,
+                parse_mode="HTML",
+                reply_markup=main_menu(),
+                disable_web_page_preview=True,
+            )
+            return
+        except TelegramRetryAfter as e:
+            wait = int(getattr(e, "retry_after", 5)) + 1
+            log.warning("Flood control for %s: waiting %ss", chat_id, wait)
+            if attempt == 0:
+                await asyncio.sleep(wait)
+            else:
+                return
+        except Exception as e:
+            log.error("send_message failed for %s: %s", chat_id, e)
+            return
 
 
 async def check_and_notify(bot: Bot) -> None:

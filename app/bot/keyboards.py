@@ -10,6 +10,7 @@ def main_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📊 Мій статус",   callback_data="status_my"),
             InlineKeyboardButton(text="🗓 Всі черги",    callback_data="status_all"),
         ],
+        [InlineKeyboardButton(text="🌅 На завтра",      callback_data="status_tomorrow")],
         [InlineKeyboardButton(text="⚙️ Налаштування",   callback_data="settings")],
         [InlineKeyboardButton(text="ℹ️ Про бота",       callback_data="about")],
         [InlineKeyboardButton(text="💛 Підтримати автора", callback_data="donate")],

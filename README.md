@@ -19,6 +19,7 @@ Telegram-бот для відстеження графіків відключе�
 - 🔔 **Автосповіщення** — повідомлення одразу після оновлення графіку
 - 📋 **Вибір черги** — інлайн-кнопки, можна додати кілька черг
 - 🗓 **Всі черги** — перегляд повного графіку одним дотиком
+- 🌅 **На завтра** — графік на наступний день, щойно оператор його опублікує
 - ⚙️ **Налаштування** — додати/видалити черги, перемкнути режим (тільки свої / всі)
 - ⚠️ **ГАВ/СГАВ** — попередження про аварійні відключення поза графіком
 - 💾 **SQLite + aiosqlite** — зберігання налаштувань на постійному томі Fly.io
@@ -38,7 +39,7 @@ Telegram-бот для відстеження графіків відключе�
 
 **Scheduler** [![APScheduler](https://img.shields.io/badge/APScheduler-3.x-ff6b35?style=flat-square)](#)
 
-**Data source** [![zoe.com.ua](https://img.shields.io/badge/zoe.com.ua-HTML_scraper-00b894?style=flat-square)](#)
+**Data source** [![zoe.com.ua](https://img.shields.io/badge/zoe.com.ua-via_OE_OUTAGE_DATA-00b894?style=flat-square)](https://github.com/yaroslav2901/OE_OUTAGE_DATA) [![alerts.energy](https://img.shields.io/badge/alerts.energy-fallback-ff6b35?style=flat-square)](https://alerts.energy/zaporizka-oblast)
 
 ---
 
@@ -54,7 +55,12 @@ zp_light_bot/
 │   ├── db/
 │   │   └── database.py       — SQLite schema, user CRUD, schedule state
 │   ├── parser/
-│   │   └── schedule.py       — HTML scraper, schedule parser, formatter
+│   │   ├── base.py           — Schedule model, timezone, month names
+│   │   ├── schedule.py       — fetch facade + status/format helpers
+│   │   └── providers/
+│   │       ├── svitlo_zp.py  — PRIMARY: svitlo.zp.ua Google Sheets CSV (today+tomorrow)
+│   │       ├── oe_outage.py  — FALLBACK 1: OE_OUTAGE_DATA JSON (GitHub raw)
+│   │       └── alerts_energy.py — FALLBACK 2: alerts.energy HTML scraper
 │   └── scheduler/
 │       └── notifier.py       — notification logic (runs every 3 min)
 ├── Dockerfile
