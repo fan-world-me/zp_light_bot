@@ -105,6 +105,7 @@ async def cb_status_my(cb: CallbackQuery) -> None:
     try:
         today, _ = await fetch_schedules()
     except Exception as e:
+        log.error("status_my fetch error: %s", e, exc_info=True)
         await cb.message.answer(
             "❌ Не вдалося отримати графік. Спробуй пізніше.",
             reply_markup=main_menu(), parse_mode="HTML",
@@ -131,6 +132,7 @@ async def cb_status_all(cb: CallbackQuery) -> None:
     try:
         today, _ = await fetch_schedules()
     except Exception:
+        log.error("status_all fetch error", exc_info=True)
         await cb.message.answer(
             "❌ Не вдалося отримати графік. Спробуй пізніше.",
             reply_markup=main_menu(), parse_mode="HTML",

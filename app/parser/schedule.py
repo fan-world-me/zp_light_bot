@@ -2,7 +2,7 @@ import re
 import httpx
 from bs4 import BeautifulSoup
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 URL = "https://www.zoe.com.ua/outage/"
@@ -16,17 +16,21 @@ MONTHS = {
 
 QUEUE_RE = re.compile(r"^\s*(\d\.\d):\s*(.+)$", re.M)
 TIME_RE  = re.compile(r"(\d{2}:\d{2})\s*[–\-]\s*(\d{2}:\d{2})")
-DATE_RE  = re.compile(r"(\d{1,2})\s+(" + "|".join(MONTHS) + ")", re.I)
+# Title has uppercase month: "16 ЛИСТОПАДА" — match case-insensitively
+DATE_RE  = re.compile(
+    r"(\d{1,2})\s+(" + "|".join(MONTHS) + ")",
+    re.I | re.U,
+)
 UPD_RE   = re.compile(r"оновлено\s+(\d{2}:\d{2})", re.I)
 
 
 @dataclass
 class Schedule:
-    title:      str
-    day:        int | None
-    month:      int | None
-    updated:    str | None
-    queues:     dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+    title:       str
+    day:         int | None
+    month:       int | None
+    updated:     str | None
+    queues:      dict[str, list[tuple[str, str]]] = field(default_factory=dict)
     gav_warning: bool = False
 
 
@@ -35,12 +39,10 @@ def _to_min(t: str) -> int:
     return h * 60 + m
 
 
-def _parse_article(art) -> Schedule | None:
-    content = art.select_one("div.content") or art
-    text = content.get_text("\n")
-
+def _parse_block(title: str, body: str) -> "Schedule | None":
+    """Parse one text block that has a title and queue lines."""
     queues: dict[str, list[tuple[str, str]]] = {}
-    for q, rest in QUEUE_RE.findall(text):
+    for q, rest in QUEUE_RE.findall(body):
         times = TIME_RE.findall(rest)
         if times and q not in queues:
             queues[q] = [(a, b) for a, b in times]
@@ -48,24 +50,21 @@ def _parse_article(art) -> Schedule | None:
     if not queues:
         return None
 
-    h2 = art.find("h2")
-    title = h2.get_text(" ", strip=True) if h2 else ""
-    blob  = title + "\n" + text
-
+    blob = title + "\n" + body
     d = DATE_RE.search(blob)
     u = UPD_RE.search(blob)
 
     return Schedule(
-        title=title,
+        title=title.strip(),
         day=int(d[1]) if d else None,
         month=MONTHS[d[2].lower()] if d else None,
         updated=u[1] if u else None,
         queues=queues,
-        gav_warning="ГАВ" in text,
+        gav_warning=bool(re.search(r"ГАВ|СГАВ", body)),
     )
 
 
-async def fetch_schedules() -> tuple[Schedule | None, Schedule | None]:
+async def fetch_schedules() -> tuple["Schedule | None", "Schedule | None"]:
     """Return (today_schedule, tomorrow_schedule). Either can be None."""
     async with httpx.AsyncClient(
         headers={"User-Agent": "Mozilla/5.0 (compatible; zp-light-bot/1.0)"},
@@ -76,19 +75,48 @@ async def fetch_schedules() -> tuple[Schedule | None, Schedule | None]:
         resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    now       = datetime.now(TZ)
-    today_d   = now.day
-    today_m   = now.month
-    from datetime import timedelta
-    tomorrow  = now + timedelta(days=1)
+
+    now        = datetime.now(TZ)
+    today_d    = now.day
+    today_m    = now.month
+    tomorrow   = now + timedelta(days=1)
     tomorrow_d = tomorrow.day
     tomorrow_m = tomorrow.month
 
     today_sched:    Schedule | None = None
     tomorrow_sched: Schedule | None = None
 
-    for art in soup.select("article"):
-        parsed = _parse_article(art)
+    # The page has no <article> tags — content lives in <div> blocks.
+    # Each block has a heading element and a sibling/child with the schedule text.
+    # Strategy: grab every element that looks like a heading, pair it with the
+    # nearest text block, and try to parse a schedule from it.
+
+    # Collect all (title_text, body_text) pairs from the page.
+    # The page structure is flat divs; we scan all text nodes grouped by headings.
+    page_text = soup.get_text("\n")
+
+    # Split the whole page text into blocks by headings that contain a date.
+    # Each heading starts with a digit or "ОНОВЛЕНО"
+    heading_re = re.compile(
+        r"((?:ОНОВЛЕНО\s+)?ГПВ\s+НА\s+\d{1,2}\s+\S+|"
+        r"\d{1,2}\s+\S+\s+ПО\s+ЗАПОРІЗЬКІЙ)",
+        re.I,
+    )
+
+    # Find all heading positions in the full page text
+    blocks = []
+    last_end = 0
+    last_title = None
+    for m in heading_re.finditer(page_text):
+        if last_title is not None:
+            blocks.append((last_title, page_text[last_end:m.start()]))
+        last_title = m.group()
+        last_end = m.end()
+    if last_title is not None:
+        blocks.append((last_title, page_text[last_end:]))
+
+    for title, body in blocks:
+        parsed = _parse_block(title, body)
         if not parsed:
             continue
         if today_sched is None and parsed.day == today_d and parsed.month == today_m:
