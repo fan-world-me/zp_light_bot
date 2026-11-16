@@ -1,13 +1,24 @@
 import re
+import logging
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
+from aiogram.exceptions import TelegramBadRequest
 
 from app.db.database import get_user, upsert_user
 from app.parser.schedule import fetch_schedules, format_schedule
 from app.bot.keyboards import main_menu, settings_menu, queue_picker
 
 router = Router()
+log = logging.getLogger(__name__)
+
+
+async def _answer(cb: CallbackQuery, text: str = "") -> None:
+    """cb.answer() that silently ignores expired query errors."""
+    try:
+        await cb.answer(text)
+    except TelegramBadRequest:
+        pass
 
 ABOUT_TEXT = (
     "🤖 <b>ZP Light Bot</b>\n\n"
@@ -73,13 +84,13 @@ async def fallback(msg: Message) -> None:
 # ── callbacks ─────────────────────────────────────────────────────────────────
 @router.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery) -> None:
-    await cb.answer()
+    await _answer(cb)
     await cb.message.answer("Головне меню:", reply_markup=main_menu(), parse_mode="HTML")
 
 
 @router.callback_query(F.data == "status_my")
 async def cb_status_my(cb: CallbackQuery) -> None:
-    await cb.answer()
+    await _answer(cb)
     user = await _get_or_create(cb.message.chat.id)
 
     if not user["queues"]:
@@ -116,7 +127,7 @@ async def cb_status_my(cb: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "status_all")
 async def cb_status_all(cb: CallbackQuery) -> None:
-    await cb.answer()
+    await _answer(cb)
     try:
         today, _ = await fetch_schedules()
     except Exception:
@@ -142,7 +153,7 @@ async def cb_status_all(cb: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "settings")
 async def cb_settings(cb: CallbackQuery) -> None:
-    await cb.answer()
+    await _answer(cb)
     user = await _get_or_create(cb.message.chat.id)
     queues_str = ", ".join(user["queues"]) if user["queues"] else "<i>не вибрано</i>"
     notify_str = "всі черги" if user["notify_all"] else "тільки мої"
@@ -157,7 +168,7 @@ async def cb_settings(cb: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "add_queue")
 async def cb_add_queue(cb: CallbackQuery) -> None:
-    await cb.answer()
+    await _answer(cb)
     user = await _get_or_create(cb.message.chat.id)
     await cb.message.answer(
         "Обери черги, які хочеш додати (можна декілька):",
@@ -168,7 +179,7 @@ async def cb_add_queue(cb: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("pick_add:"))
 async def cb_pick_add(cb: CallbackQuery) -> None:
-    await cb.answer()
+    await _answer(cb)
     q    = cb.data.split(":")[1]
     user = await _get_or_create(cb.message.chat.id)
 
@@ -187,7 +198,7 @@ async def cb_pick_add(cb: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "remove_queue")
 async def cb_remove_queue(cb: CallbackQuery) -> None:
-    await cb.answer()
+    await _answer(cb)
     user = await _get_or_create(cb.message.chat.id)
 
     if not user["queues"]:
@@ -207,7 +218,7 @@ async def cb_remove_queue(cb: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("pick_remove:"))
 async def cb_pick_remove(cb: CallbackQuery) -> None:
-    await cb.answer()
+    await _answer(cb)
     q    = cb.data.split(":")[1]
     user = await _get_or_create(cb.message.chat.id)
 
@@ -231,7 +242,7 @@ async def cb_pick_remove(cb: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "toggle_notify")
 async def cb_toggle_notify(cb: CallbackQuery) -> None:
-    await cb.answer()
+    await _answer(cb)
     user = await _get_or_create(cb.message.chat.id)
     user["notify_all"] = not user["notify_all"]
     await upsert_user(cb.message.chat.id, user["queues"], user["notify_all"])
@@ -245,7 +256,7 @@ async def cb_toggle_notify(cb: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "about")
 async def cb_about(cb: CallbackQuery) -> None:
-    await cb.answer()
+    await _answer(cb)
     await cb.message.answer(
         ABOUT_TEXT,
         reply_markup=main_menu(),
@@ -256,7 +267,7 @@ async def cb_about(cb: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "donate")
 async def cb_donate(cb: CallbackQuery) -> None:
-    await cb.answer()
+    await _answer(cb)
     await cb.message.answer(
         DONATE_TEXT,
         reply_markup=main_menu(),

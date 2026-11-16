@@ -8,8 +8,24 @@ from app.bot.keyboards import main_menu
 
 log = logging.getLogger(__name__)
 
-# Telegram allows 30 msg/sec; we use 35ms gap to stay safe
 SEND_DELAY = 0.035
+_FETCH_RETRIES = 3
+_FETCH_RETRY_DELAY = 10  # seconds between retries
+
+
+async def _fetch_with_retry():
+    last_exc = None
+    for attempt in range(1, _FETCH_RETRIES + 1):
+        try:
+            return await fetch_schedules()
+        except Exception as e:
+            last_exc = e
+            log.warning("Scheduler: fetch attempt %d/%d failed: %s: %s",
+                        attempt, _FETCH_RETRIES, type(e).__name__, e)
+            if attempt < _FETCH_RETRIES:
+                await asyncio.sleep(_FETCH_RETRY_DELAY)
+    log.error("Scheduler: all %d fetch attempts failed", _FETCH_RETRIES, exc_info=last_exc)
+    return None
 
 
 async def _send_safe(bot: Bot, chat_id: int, text: str) -> None:
@@ -28,11 +44,10 @@ async def _send_safe(bot: Bot, chat_id: int, text: str) -> None:
 async def check_and_notify(bot: Bot) -> None:
     log.info("Scheduler: fetching schedules...")
 
-    try:
-        today, tomorrow = await fetch_schedules()
-    except Exception as e:
-        log.error("Scheduler: fetch failed: %s", e)
+    result = await _fetch_with_retry()
+    if result is None:
         return
+    today, tomorrow = result
 
     if not today:
         log.warning("Scheduler: no today schedule found")
