@@ -20,6 +20,49 @@ async def _answer(cb: CallbackQuery, text: str = "") -> None:
     except TelegramBadRequest:
         pass
 
+
+async def _show(
+    cb: CallbackQuery,
+    text: str,
+    reply_markup=None,
+    disable_preview: bool = False,
+) -> None:
+    """Редагує повідомлення, на якому натиснули кнопку, замість надсилання нового.
+
+    Нове повідомлення надсилається лише якщо редагувати не можна:
+    оригінал старший за 48 год (InaccessibleMessage), видалений, або
+    Telegram віддав іншу помилку. Якщо текст не змінився — просто мовчимо.
+    """
+    msg = cb.message
+
+    if msg is not None and hasattr(msg, "edit_text"):
+        try:
+            await msg.edit_text(
+                text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=disable_preview,
+            )
+            return
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return
+            log.info("edit_text failed (%s), sending new message", e)
+        except Exception as e:
+            log.warning("edit_text unexpected error: %s", e)
+
+    try:
+        chat_id = msg.chat.id if msg is not None else cb.from_user.id
+        await cb.bot.send_message(
+            chat_id,
+            text,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+            disable_web_page_preview=disable_preview,
+        )
+    except Exception as e:
+        log.error("fallback send_message failed: %s", e)
+
+
 ABOUT_TEXT = (
     "🤖 <b>ZP Light Bot</b>\n\n"
     "Бот стежить за графіком відключень світла у Запорізькій області "
@@ -86,7 +129,7 @@ async def fallback(msg: Message) -> None:
 @router.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery) -> None:
     await _answer(cb)
-    await cb.message.answer("Головне меню:", reply_markup=main_menu(), parse_mode="HTML")
+    await _show(cb, "Головне меню:", main_menu())
 
 
 @router.callback_query(F.data == "status_my")
@@ -95,11 +138,11 @@ async def cb_status_my(cb: CallbackQuery) -> None:
     user = await _get_or_create(cb.message.chat.id)
 
     if not user["queues"]:
-        await cb.message.answer(
+        await _show(
+            cb,
             "⚠️ Ти ще не додав жодної черги.\n"
             "Перейди в <b>Налаштування → Додати чергу</b>.",
-            reply_markup=main_menu(),
-            parse_mode="HTML",
+            main_menu(),
         )
         return
 
@@ -107,24 +150,14 @@ async def cb_status_my(cb: CallbackQuery) -> None:
         today, _ = await fetch_schedules()
     except Exception as e:
         log.error("status_my fetch error: %s", e, exc_info=True)
-        await cb.message.answer(
-            "❌ Не вдалося отримати графік. Спробуй пізніше.",
-            reply_markup=main_menu(), parse_mode="HTML",
-        )
+        await _show(cb, "❌ Не вдалося отримати графік. Спробуй пізніше.", main_menu())
         return
 
     if not today:
-        await cb.message.answer(
-            "😕 Графік на сьогодні не знайдено.",
-            reply_markup=main_menu(), parse_mode="HTML",
-        )
+        await _show(cb, "😕 Графік на сьогодні не знайдено.", main_menu())
         return
 
-    await cb.message.answer(
-        format_schedule(today, user["queues"]),
-        reply_markup=main_menu(),
-        parse_mode="HTML",
-    )
+    await _show(cb, format_schedule(today, user["queues"]), main_menu())
 
 
 @router.callback_query(F.data == "status_all")
@@ -134,24 +167,14 @@ async def cb_status_all(cb: CallbackQuery) -> None:
         today, _ = await fetch_schedules()
     except Exception:
         log.error("status_all fetch error", exc_info=True)
-        await cb.message.answer(
-            "❌ Не вдалося отримати графік. Спробуй пізніше.",
-            reply_markup=main_menu(), parse_mode="HTML",
-        )
+        await _show(cb, "❌ Не вдалося отримати графік. Спробуй пізніше.", main_menu())
         return
 
     if not today:
-        await cb.message.answer(
-            "😕 Графік на сьогодні не знайдено.",
-            reply_markup=main_menu(), parse_mode="HTML",
-        )
+        await _show(cb, "😕 Графік на сьогодні не знайдено.", main_menu())
         return
 
-    await cb.message.answer(
-        format_schedule(today, None),
-        reply_markup=main_menu(),
-        parse_mode="HTML",
-    )
+    await _show(cb, format_schedule(today, None), main_menu())
 
 
 # ── на завтра ────────────────────────────────────────────────────────────────
@@ -160,25 +183,19 @@ async def _send_tomorrow(cb: CallbackQuery, queue_ids: list[str] | None) -> None
         _, tomorrow = await fetch_schedules()
     except Exception:
         log.error("status_tomorrow fetch error", exc_info=True)
-        await cb.message.answer(
-            "❌ Не вдалося отримати графік. Спробуй пізніше.",
-            reply_markup=main_menu(), parse_mode="HTML",
-        )
+        await _show(cb, "❌ Не вдалося отримати графік. Спробуй пізніше.", main_menu())
         return
 
     if not tomorrow:
-        await cb.message.answer(
+        await _show(
+            cb,
             "🌙 Графік на завтра ще не опублікований.\n"
             "Оператор зазвичай публікує його ввечері.",
-            reply_markup=main_menu(), parse_mode="HTML",
+            main_menu(),
         )
         return
 
-    await cb.message.answer(
-        format_schedule(tomorrow, queue_ids),
-        reply_markup=main_menu(),
-        parse_mode="HTML",
-    )
+    await _show(cb, format_schedule(tomorrow, queue_ids), main_menu())
 
 
 @router.callback_query(F.data == "status_tomorrow")
@@ -194,12 +211,12 @@ async def cb_settings(cb: CallbackQuery) -> None:
     user = await _get_or_create(cb.message.chat.id)
     queues_str = ", ".join(user["queues"]) if user["queues"] else "<i>не вибрано</i>"
     notify_str = "всі черги" if user["notify_all"] else "тільки мої"
-    await cb.message.answer(
+    await _show(
+        cb,
         f"⚙️ <b>Налаштування</b>\n\n"
         f"Твої черги: <b>{queues_str}</b>\n"
         f"Сповіщення: <b>{notify_str}</b>",
-        reply_markup=settings_menu(user["notify_all"]),
-        parse_mode="HTML",
+        settings_menu(user["notify_all"]),
     )
 
 
@@ -207,10 +224,10 @@ async def cb_settings(cb: CallbackQuery) -> None:
 async def cb_add_queue(cb: CallbackQuery) -> None:
     await _answer(cb)
     user = await _get_or_create(cb.message.chat.id)
-    await cb.message.answer(
+    await _show(
+        cb,
         "Обери черги, які хочеш додати (можна декілька):",
-        reply_markup=queue_picker(user["queues"], "pick_add"),
-        parse_mode="HTML",
+        queue_picker(user["queues"], "pick_add"),
     )
 
 
@@ -226,10 +243,10 @@ async def cb_pick_add(cb: CallbackQuery) -> None:
         await upsert_user(cb.message.chat.id, user["queues"], user["notify_all"])
 
     queues_str = ", ".join(user["queues"])
-    await cb.message.answer(
+    await _show(
+        cb,
         f"✅ Черга <b>{q}</b> додана.\nТвої черги: <b>{queues_str}</b>\n\nДодай ще або повернись назад:",
-        reply_markup=queue_picker(user["queues"], "pick_add"),
-        parse_mode="HTML",
+        queue_picker(user["queues"], "pick_add"),
     )
 
 
@@ -239,17 +256,13 @@ async def cb_remove_queue(cb: CallbackQuery) -> None:
     user = await _get_or_create(cb.message.chat.id)
 
     if not user["queues"]:
-        await cb.message.answer(
-            "У тебе немає доданих черг.",
-            reply_markup=settings_menu(user["notify_all"]),
-            parse_mode="HTML",
-        )
+        await _show(cb, "У тебе немає доданих черг.", settings_menu(user["notify_all"]))
         return
 
-    await cb.message.answer(
+    await _show(
+        cb,
         "Обери чергу, яку хочеш видалити:",
-        reply_markup=queue_picker(user["queues"], "pick_remove"),
-        parse_mode="HTML",
+        queue_picker(user["queues"], "pick_remove"),
     )
 
 
@@ -263,17 +276,17 @@ async def cb_pick_remove(cb: CallbackQuery) -> None:
     await upsert_user(cb.message.chat.id, user["queues"], user["notify_all"])
 
     if not user["queues"]:
-        await cb.message.answer(
+        await _show(
+            cb,
             f"✅ Черга <b>{q}</b> видалена. Список черг порожній.",
-            reply_markup=settings_menu(user["notify_all"]),
-            parse_mode="HTML",
+            settings_menu(user["notify_all"]),
         )
     else:
         queues_str = ", ".join(user["queues"])
-        await cb.message.answer(
+        await _show(
+            cb,
             f"✅ Черга <b>{q}</b> видалена.\nТвої черги: <b>{queues_str}</b>",
-            reply_markup=queue_picker(user["queues"], "pick_remove"),
-            parse_mode="HTML",
+            queue_picker(user["queues"], "pick_remove"),
         )
 
 
@@ -284,29 +297,16 @@ async def cb_toggle_notify(cb: CallbackQuery) -> None:
     user["notify_all"] = not user["notify_all"]
     await upsert_user(cb.message.chat.id, user["queues"], user["notify_all"])
     mode = "всі черги" if user["notify_all"] else "тільки мої"
-    await cb.message.answer(
-        f"🔔 Сповіщення: <b>{mode}</b>",
-        reply_markup=settings_menu(user["notify_all"]),
-        parse_mode="HTML",
-    )
+    await _show(cb, f"🔔 Сповіщення: <b>{mode}</b>", settings_menu(user["notify_all"]))
 
 
 @router.callback_query(F.data == "about")
 async def cb_about(cb: CallbackQuery) -> None:
     await _answer(cb)
-    await cb.message.answer(
-        ABOUT_TEXT,
-        reply_markup=main_menu(),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
+    await _show(cb, ABOUT_TEXT, main_menu(), disable_preview=True)
 
 
 @router.callback_query(F.data == "donate")
 async def cb_donate(cb: CallbackQuery) -> None:
     await _answer(cb)
-    await cb.message.answer(
-        DONATE_TEXT,
-        reply_markup=main_menu(),
-        parse_mode="HTML",
-    )
+    await _show(cb, DONATE_TEXT, main_menu())
