@@ -1,0 +1,41 @@
+# fly.toml app configuration file generated for zp-light-bot on 2026-11-16T18:32:23+02:00
+#
+# See https://docs.fly.io/reference/configuration for information about how to use this file.
+#
+
+app = 'zp-light-bot'
+primary_region = 'fra'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[deploy]
+  strategy = 'immediate'
+
+[env]
+  DB_PATH = '/data/bot.db'
+  WEBHOOK_HOST = 'https://zp-light-bot.fly.dev'
+
+[[mounts]]
+  source = 'zp_bot_data'
+  destination = '/data'
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/healthz'
+
+[[vm]]
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256

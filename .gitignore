@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+/data/
+*.db
+.fly/
+.wrangler/
+package-lock.json
+node_modules/
