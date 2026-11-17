@@ -1,24 +1,36 @@
 import asyncio
 import logging
-from aiogram import Bot
-from aiogram.exceptions import TelegramRetryAfter
+from datetime import datetime, timedelta
 
-from app.db.database import get_all_users, get_schedule_state, set_schedule_state
-from app.parser.schedule import fetch_schedules, format_schedule
+from aiogram import Bot
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
+
 from app.bot.keyboards import main_menu
+from app.db.database import (
+    delete_user,
+    get_all_users,
+    get_snapshots,
+    save_snapshots,
+)
+from app.parser.base import TZ, Schedule
+from app.parser.schedule import fetch_schedules, format_schedule
 
 log = logging.getLogger(__name__)
 
-SEND_DELAY = 0.05  # ~20 msg/s — с запасом до лимита Telegram в 30 msg/s
+SEND_DELAY = 0.05  # ~20 msg/s — із запасом до ліміту Telegram у 30 msg/s
 _FETCH_RETRIES = 3
-_FETCH_RETRY_DELAY = 10  # seconds between retries
+_FETCH_RETRY_DELAY = 5  # seconds between retries
 
 
 async def _fetch_with_retry():
     last_exc = None
     for attempt in range(1, _FETCH_RETRIES + 1):
         try:
-            return await fetch_schedules()
+            return await fetch_schedules(force=True)
         except Exception as e:
             last_exc = e
             log.warning("Scheduler: fetch attempt %d/%d failed: %s: %s",
@@ -47,9 +59,36 @@ async def _send_safe(bot: Bot, chat_id: int, text: str) -> None:
                 await asyncio.sleep(wait)
             else:
                 return
+        except TelegramForbiddenError:
+            # Юзер заблокував бота / видалив чат — більше не пишемо йому
+            log.info("User %s blocked the bot, removing", chat_id)
+            await delete_user(chat_id)
+            return
+        except TelegramBadRequest as e:
+            if "chat not found" in str(e).lower():
+                log.info("Chat %s not found, removing", chat_id)
+                await delete_user(chat_id)
+            else:
+                log.error("send_message failed for %s: %s", chat_id, e)
+            return
         except Exception as e:
             log.error("send_message failed for %s: %s", chat_id, e)
             return
+
+
+def date_key(schedule: Schedule) -> str:
+    return f"{schedule.month:02d}-{schedule.day:02d}"
+
+
+def normalize(schedule: Schedule) -> dict[str, list[list[str]]]:
+    return {q: [[a, b] for a, b in iv] for q, iv in schedule.queues.items()}
+
+
+def diff_queues(old: dict | None, new: dict[str, list[list[str]]]) -> set[str]:
+    """Черги, чий розклад відрізняється від збереженого (або яких раніше не було)."""
+    if old is None:
+        return set(new)
+    return {q for q, iv in new.items() if old.get(q) != iv}
 
 
 async def check_and_notify(bot: Bot) -> None:
@@ -60,44 +99,59 @@ async def check_and_notify(bot: Bot) -> None:
         return
     today, tomorrow = result
 
-    if not today:
-        log.warning("Scheduler: no today schedule found")
+    schedules = [s for s in (today, tomorrow) if s is not None]
+    if not schedules:
+        log.warning("Scheduler: no schedules found")
         return
 
-    # Check if schedule actually changed
-    state = await get_schedule_state()
-    new_key = f"{today.day}-{today.month}-{today.updated}"
-    old_key = f"{state['day']}-{state['month']}-{state['updated_at']}"
+    now = datetime.now(TZ)
+    keep = {(now + timedelta(days=d)).strftime("%m-%d") for d in (-1, 0, 1)}
 
-    if new_key == old_key:
-        log.info("Scheduler: no update (key=%s)", new_key)
+    snapshots = await get_snapshots()
+    first_run = not snapshots  # свіжа БД / перший запуск після оновлення — тільки запам'ятовуємо
+
+    to_save: dict[str, dict] = {}
+    to_notify: list[tuple[Schedule, set[str]]] = []
+
+    for sched in schedules:
+        key = date_key(sched)
+        new = normalize(sched)
+        old = snapshots.get(key)
+        changed = diff_queues(old, new)
+        # Збираємо знімок: нові дані поверх старих (резервні джерела можуть віддати неповний набір черг)
+        merged = {**(old or {}), **new}
+        if merged != old:
+            to_save[key] = merged
+        if changed and not first_run:
+            to_notify.append((sched, changed))
+
+    if to_save or keep:
+        await save_snapshots(to_save, keep)
+
+    if first_run:
+        log.info("Scheduler: first run, snapshots seeded (%s)", ", ".join(sorted(to_save)))
         return
 
-    log.info("Scheduler: schedule updated — %s (was %s)", new_key, old_key)
-    await set_schedule_state(today.updated, today.day, today.month)
-
-    # Collect all queue IDs from today's schedule
-    all_queue_ids = list(today.queues.keys())
+    if not to_notify:
+        log.info("Scheduler: no changes")
+        return
 
     users = await get_all_users()
-    log.info("Scheduler: notifying %d users", len(users))
+    log.info("Scheduler: %d schedule(s) changed, %d users", len(to_notify), len(users))
 
-    for user in users:
-        if not user["queues"] and not user["notify_all"]:
-            continue
+    for sched, changed in to_notify:
+        log.info("Scheduler: %s changed for queues %s", sched.title, sorted(changed))
+        for user in users:
+            if user["notify_all"]:
+                queue_ids = None
+            else:
+                mine = [q for q in user["queues"] if q in sched.queues]
+                # Сповіщаємо, лише якщо змінилась хоча б одна з його черг
+                if not any(q in changed for q in mine):
+                    continue
+                queue_ids = mine
 
-        queue_ids = None if user["notify_all"] else user["queues"]
-
-        # Skip users whose queues don't appear in today's schedule
-        if queue_ids is not None:
-            matched = [q for q in queue_ids if q in today.queues]
-            if not matched:
-                continue
-            queue_ids = matched
-
-        text = format_schedule(today, queue_ids)
-        await _send_safe(bot, user["chat_id"], text)
-        await asyncio.sleep(SEND_DELAY)
+            await _send_safe(bot, user["chat_id"], format_schedule(sched, queue_ids))
+            await asyncio.sleep(SEND_DELAY)
 
     log.info("Scheduler: done")
-

@@ -19,9 +19,9 @@ def main_menu() -> InlineKeyboardMarkup:
 
 def settings_menu(notify_all: bool) -> InlineKeyboardMarkup:
     notify_label = (
-        "🔔 Сповіщення: всі черги ✅"
+        "🔔 Сповіщення: всі черги (змінити)"
         if notify_all else
-        "🔔 Сповіщення: тільки мої ✅"
+        "🔔 Сповіщення: тільки мої (змінити)"
     )
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Додати чергу",   callback_data="add_queue")],
@@ -31,13 +31,16 @@ def settings_menu(notify_all: bool) -> InlineKeyboardMarkup:
     ])
 
 
-def queue_picker(selected: list[str], action: str) -> InlineKeyboardMarkup:
+def queue_picker(selected: list[str], action: str, only_selected: bool = False) -> InlineKeyboardMarkup:
+    """only_selected=True — показати лише обрані черги (для видалення)."""
+    queues = [q for q in ALL_QUEUES if q in selected] if only_selected else ALL_QUEUES
+    mark = "❌" if only_selected else "✅"
     rows = []
-    for i in range(0, len(ALL_QUEUES), 4):
-        chunk = ALL_QUEUES[i:i + 4]
+    for i in range(0, len(queues), 4):
+        chunk = queues[i:i + 4]
         rows.append([
             InlineKeyboardButton(
-                text=f"✅ {q}" if q in selected else q,
+                text=f"{mark} {q}" if q in selected else q,
                 callback_data=f"{action}:{q}",
             )
             for q in chunk
