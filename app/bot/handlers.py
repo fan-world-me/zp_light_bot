@@ -5,7 +5,13 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
 
-from app.db.database import get_user, upsert_user
+from app.db.database import (
+    add_queue,
+    get_user,
+    remove_queue,
+    toggle_notify_all,
+    upsert_user,
+)
 from app.parser.schedule import fetch_schedules, format_schedule
 from app.bot.keyboards import main_menu, settings_menu, queue_picker
 
@@ -71,8 +77,9 @@ ABOUT_TEXT = (
     '🌐 <a href="https://fan-world-me.github.io/">Сайт автора</a>\n'
     '💻 <a href="https://github.com/fan-world-me">GitHub профіль</a>\n'
     '📦 <a href="https://github.com/fan-world-me/zp_light_bot">Репозиторій бота</a>\n\n'
-    'Дані: <a href="https://www.zoe.com.ua/outage/">zoe.com.ua</a> (дзеркало '
-    '<a href="https://github.com/yaroslav2901/OE_OUTAGE_DATA">OE_OUTAGE_DATA</a>)\n\n'
+    'Дані: <a href="https://svitlo.zp.ua/">svitlo.zp.ua</a> (графіки '
+    '<a href="https://www.zoe.com.ua/outage/">Запоріжжяобленерго</a>), резерв — '
+    '<a href="https://github.com/yaroslav2901/OE_OUTAGE_DATA">OE_OUTAGE_DATA</a>\n\n'
     "📄 Ліцензія: GPL-3.0"
 )
 
@@ -98,7 +105,7 @@ async def _get_or_create(chat_id: int) -> dict:
     return user
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
+# ── /start ──────────────────────────────────────────────────────────────────────────────────
 @router.message(CommandStart())
 async def cmd_start(msg: Message) -> None:
     await _get_or_create(msg.chat.id)
@@ -113,19 +120,19 @@ async def cmd_start(msg: Message) -> None:
     )
 
 
-# ── /menu ─────────────────────────────────────────────────────────────────────
+# ── /menu ──────────────────────────────────────────────────────────────────────────────────
 @router.message(Command("menu"))
 async def cmd_menu(msg: Message) -> None:
     await msg.answer("Головне меню:", reply_markup=main_menu(), parse_mode="HTML")
 
 
-# ── fallback text ─────────────────────────────────────────────────────────────
+# ── fallback text ──────────────────────────────────────────────────────────────────────────────────
 @router.message()
 async def fallback(msg: Message) -> None:
     await msg.answer("Скористайся меню 👇", reply_markup=main_menu(), parse_mode="HTML")
 
 
-# ── callbacks ─────────────────────────────────────────────────────────────────
+# ── callbacks ──────────────────────────────────────────────────────────────────────────────────
 @router.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery) -> None:
     await _answer(cb)
@@ -177,7 +184,7 @@ async def cb_status_all(cb: CallbackQuery) -> None:
     await _show(cb, format_schedule(today, None), main_menu())
 
 
-# ── на завтра ────────────────────────────────────────────────────────────────
+# ── на завтра ──────────────────────────────────────────────────────────────────────────────────
 async def _send_tomorrow(cb: CallbackQuery, queue_ids: list[str] | None) -> None:
     try:
         _, tomorrow = await fetch_schedules()
@@ -202,7 +209,15 @@ async def _send_tomorrow(cb: CallbackQuery, queue_ids: list[str] | None) -> None
 async def cb_status_tomorrow(cb: CallbackQuery) -> None:
     await _answer(cb)
     user = await _get_or_create(cb.message.chat.id)
-    await _send_tomorrow(cb, user["queues"] or None)
+    if not user["queues"]:
+        await _show(
+            cb,
+            "⚠️ Ти ще не додав жодної черги.\n"
+            "Перейди в <b>Налаштування → Додати чергу</b>.",
+            main_menu(),
+        )
+        return
+    await _send_tomorrow(cb, user["queues"])
 
 
 @router.callback_query(F.data == "settings")
@@ -235,12 +250,7 @@ async def cb_add_queue(cb: CallbackQuery) -> None:
 async def cb_pick_add(cb: CallbackQuery) -> None:
     await _answer(cb)
     q    = cb.data.split(":")[1]
-    user = await _get_or_create(cb.message.chat.id)
-
-    if q not in user["queues"]:
-        user["queues"].append(q)
-        user["queues"].sort()
-        await upsert_user(cb.message.chat.id, user["queues"], user["notify_all"])
+    user = await add_queue(cb.message.chat.id, q)
 
     queues_str = ", ".join(user["queues"])
     await _show(
@@ -262,7 +272,7 @@ async def cb_remove_queue(cb: CallbackQuery) -> None:
     await _show(
         cb,
         "Обери чергу, яку хочеш видалити:",
-        queue_picker(user["queues"], "pick_remove"),
+        queue_picker(user["queues"], "pick_remove", only_selected=True),
     )
 
 
@@ -270,10 +280,7 @@ async def cb_remove_queue(cb: CallbackQuery) -> None:
 async def cb_pick_remove(cb: CallbackQuery) -> None:
     await _answer(cb)
     q    = cb.data.split(":")[1]
-    user = await _get_or_create(cb.message.chat.id)
-
-    user["queues"] = [x for x in user["queues"] if x != q]
-    await upsert_user(cb.message.chat.id, user["queues"], user["notify_all"])
+    user = await remove_queue(cb.message.chat.id, q)
 
     if not user["queues"]:
         await _show(
@@ -286,16 +293,14 @@ async def cb_pick_remove(cb: CallbackQuery) -> None:
         await _show(
             cb,
             f"✅ Черга <b>{q}</b> видалена.\nТвої черги: <b>{queues_str}</b>",
-            queue_picker(user["queues"], "pick_remove"),
+            queue_picker(user["queues"], "pick_remove", only_selected=True),
         )
 
 
 @router.callback_query(F.data == "toggle_notify")
 async def cb_toggle_notify(cb: CallbackQuery) -> None:
     await _answer(cb)
-    user = await _get_or_create(cb.message.chat.id)
-    user["notify_all"] = not user["notify_all"]
-    await upsert_user(cb.message.chat.id, user["queues"], user["notify_all"])
+    user = await toggle_notify_all(cb.message.chat.id)
     mode = "всі черги" if user["notify_all"] else "тільки мої"
     await _show(cb, f"🔔 Сповіщення: <b>{mode}</b>", settings_menu(user["notify_all"]))
 

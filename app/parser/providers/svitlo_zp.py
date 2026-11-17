@@ -2,7 +2,7 @@
 
 svitlo.zp.ua — волонтерський моніторинг Запоріжжя. Свій пайплайн пише розклад
 ПАТ «Запоріжжяобленерго» у дві публічні Google-таблиці (авто-парсер і
-«напівавто» з перевіркою людини) — по одному рядку на день, включно ізtomorrow.
+«напівавто» з перевіркою людини) — по одному рядку на день, включно із завтрашнім.
 CSV публічний (export?format=csv), доступний з будь-якого регіону; на випадок
 блоків є Cloudflare Worker-проксі того ж сайту.
 
@@ -12,6 +12,7 @@ raw_data_json: {"date":"15.11.2026","updated_time":"17:37",
                 "schedule":[{"subqueue":"2.1",
                              "intervals":[{"start":"15:30","end":"18:00"}, ...]}]}
 """
+import asyncio
 import csv
 import io
 import json
@@ -55,14 +56,30 @@ def _row_freshness(row: dict) -> int:
     return _hhmm(row.get("site_updated_time") or row.get("time"))
 
 
-def _fetch_rows_from_csv(csv_text: str) -> dict[str, dict]:
-    """date (dd.mm.yyyy) -> найсвіжіший рядок дня."""
+def _fetch_rows_from_csv(csv_text: str, wanted: set[str] | None = None) -> dict[str, dict]:
+    """date (dd.mm.yyyy) -> найсвіжіший рядок дня.
+
+    Таблиця містить історію за багато днів, а потрібні лише сьогодні/завтра, тому
+    словник будуємо тільки для рядків із потрібною датою (на порядок дешевше за DictReader).
+    """
     rows: dict[str, dict] = {}
-    reader = csv.DictReader(io.StringIO(csv_text))
-    for row in reader:
-        d = (row.get("date") or "").strip()
-        if not d:
+    reader = csv.reader(io.StringIO(csv_text))
+    header = next(reader, None)
+    if not header:
+        return rows
+    header = [h.strip() for h in header]
+    try:
+        date_idx = header.index("date")
+    except ValueError:
+        return rows
+
+    for cells in reader:
+        if date_idx >= len(cells):
             continue
+        d = cells[date_idx].strip()
+        if not d or (wanted is not None and d not in wanted):
+            continue
+        row = dict(zip(header, cells))
         old = rows.get(d)
         if old is None or _row_freshness(row) >= _row_freshness(old):
             rows[d] = row
@@ -114,7 +131,7 @@ def _update_label(row: dict) -> str | None:
     return None
 
 
-def _schedule_from_row(row: dict, date_str: str) -> Schedule | None:
+def _schedule_from_row(row: dict, date_str: str, allow_empty: bool = True) -> Schedule | None:
     try:
         d = datetime.strptime(date_str, "%d.%m.%Y").date()
     except ValueError:
@@ -126,7 +143,10 @@ def _schedule_from_row(row: dict, date_str: str) -> Schedule | None:
         queues = _parse_raw_text(row.get("raw_data") or "")
 
     if not queues and not (row.get("raw_data") or "").strip():
-        # Рядок на день є, даних нема — трактуємо як "без відключень"
+        if not allow_empty:
+            # Для «завтра» порожній рядок = графік ще не опублікований, а не «відключень нема»
+            return None
+        # Рядок на сьогодні є, даних нема — трактуємо як "без відключень"
         queues = {f"{g}.{s}": [] for g in range(1, 7) for s in (1, 2)}
     if not queues:
         return None
@@ -140,19 +160,25 @@ def _schedule_from_row(row: dict, date_str: str) -> Schedule | None:
     )
 
 
-def _rows_to_schedules(rows: dict[str, dict]) -> tuple[Schedule | None, Schedule | None]:
+def _wanted_dates() -> tuple[str, str]:
     now = datetime.now(TZ).date()
     return (
-        _schedule_from_row(rows[now.strftime("%d.%m.%Y")], now.strftime("%d.%m.%Y"))
-        if now.strftime("%d.%m.%Y") in rows
-        else None,
-        _schedule_from_row(
-            rows[(now + timedelta(days=1)).strftime("%d.%m.%Y")],
-            (now + timedelta(days=1)).strftime("%d.%m.%Y"),
-        )
-        if (now + timedelta(days=1)).strftime("%d.%m.%Y") in rows
-        else None,
+        now.strftime("%d.%m.%Y"),
+        (now + timedelta(days=1)).strftime("%d.%m.%Y"),
     )
+
+
+def _rows_to_schedules(rows: dict[str, dict]) -> tuple[Schedule | None, Schedule | None]:
+    today_str, tomorrow_str = _wanted_dates()
+    today = (
+        _schedule_from_row(rows[today_str], today_str, allow_empty=True)
+        if today_str in rows else None
+    )
+    tomorrow = (
+        _schedule_from_row(rows[tomorrow_str], tomorrow_str, allow_empty=False)
+        if tomorrow_str in rows else None
+    )
+    return today, tomorrow
 
 
 async def _fetch_sheet(client: httpx.AsyncClient, sheet_id: str) -> str:
@@ -169,32 +195,36 @@ async def _fetch_sheet(client: httpx.AsyncClient, sheet_id: str) -> str:
     raise last_exc or RuntimeError("sheet fetch failed")
 
 
+def _merge_sheets(results: list[str | None]) -> dict[str, dict]:
+    """CPU-важка частина (парсинг CSV) — викликається в окремому потоці."""
+    wanted = set(_wanted_dates())
+    rows: dict[str, dict] = {}
+    for csv_text in results:
+        if not csv_text:
+            continue
+        for d, row in _fetch_rows_from_csv(csv_text, wanted).items():
+            old = rows.get(d)
+            if old is None or _row_freshness(row) >= _row_freshness(old):
+                rows[d] = row
+    return rows
+
+
 async def fetch() -> tuple[Schedule | None, Schedule | None]:
     """(на сьогодні, на завтра). Кращий рядок із двох таблиць за свіжістю."""
     async with httpx.AsyncClient(
         headers={"User-Agent": "zp_light_bot/2.0 (+https://github.com/fan-world-me/zp_light_bot)"},
         follow_redirects=True,
-        timeout=20,
+        timeout=httpx.Timeout(8.0, connect=4.0),
     ) as client:
         results = await _gather_two(client)
 
-    rows: dict[str, dict] = {}
-    for csv_text in results:
-        if not csv_text:
-            continue
-        for d, row in _fetch_rows_from_csv(csv_text).items():
-            old = rows.get(d)
-            if old is None or _row_freshness(row) >= _row_freshness(old):
-                rows[d] = row
-
+    rows = await asyncio.to_thread(_merge_sheets, results)
     if not rows:
         return None, None
     return _rows_to_schedules(rows)
 
 
 async def _gather_two(client: httpx.AsyncClient) -> list[str | None]:
-    import asyncio
-
     async def safe(sheet_id: str) -> str | None:
         try:
             return await _fetch_sheet(client, sheet_id)

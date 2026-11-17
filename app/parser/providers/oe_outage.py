@@ -3,7 +3,7 @@
 Проєкт парсить zoe.com.ua кожні ~5 хв через GitHub Actions і комітить JSON з
 погодинним статусом світла для кожної черги. raw.githubusercontent.com — це
 глобальний CDN GitHub: доступний з будь-якого регіону (на відміну від
-zoe.com.ua, який віддає сторінку лише з українських IP), без ключів і лімітів.
+зое.com.ua, який віддає сторінку лише з українських IP), без ключів і лімітів.
 
 Формат JSON (Запоріжжя):
 {
@@ -29,7 +29,7 @@ import re
 
 import httpx
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.parser.base import TZ, Schedule, title_for, minutes_to_hm
 
@@ -75,34 +75,30 @@ def _hours_to_intervals(hours: dict) -> list[tuple[str, str]]:
 
 
 def _pick_days(data: dict) -> tuple[int | None, int | None]:
-    """Вибрати ключі "сьогодні" та "завтра" з fact.data (Unix -> північ Kyiv)."""
-    entries: dict[int, dict] = {}
-    for k, v in data.items():
+    """Вибрати ключі "сьогодні" та "завтра" з fact.data (Unix -> північ Kyiv).
+
+    Беремо рівно сьогоднішню та завтрашню дату. Якщо запису на сьогодні нема —
+    повертаємо None, а не підставляємо найближчий майбутній день як «сьогодні».
+    """
+    today_date = datetime.now(TZ).date()
+    tomorrow_date = today_date + timedelta(days=1)
+    today: int | None = None
+    tomorrow: int | None = None
+    for k in sorted(data, key=lambda x: str(x)):
         try:
-            entries[int(k)] = v
+            ts = int(k)
         except (TypeError, ValueError):
             continue
-    if not entries:
-        return None, None
-
-    today: int | None = None
-    now_date = datetime.now(TZ).date()
-    same_day = [ts for ts in entries if datetime.fromtimestamp(ts, TZ).date() == now_date]
-    future = sorted(ts for ts in entries if datetime.fromtimestamp(ts, TZ).date() >= now_date)
-    if same_day:
-        today = same_day[0]
-    elif future:
-        today = future[0]
-    else:
-        today = max(entries)
-
-    later = sorted(ts for ts in entries if ts > today)
-    tomorrow = later[0] if later else None
+        d = datetime.fromtimestamp(ts, TZ).date()
+        if d == today_date and today is None:
+            today = ts
+        elif d == tomorrow_date and tomorrow is None:
+            tomorrow = ts
     return today, tomorrow
 
 
 def _updated_label(fact: dict, payload: dict) -> str | None:
-    """Час оновлення для повідомлень та ключа стану ("16:27")."""
+    """Час оновлення для повідомлень ("16:27")."""
     raw = fact.get("update")
     if isinstance(raw, str) and raw.strip():
         m = _UPDATE_TIME_RE.search(raw)
@@ -134,7 +130,7 @@ async def fetch() -> tuple[Schedule | None, Schedule | None]:
     """(графік на сьогодні, графік на завтра). None — даних немає."""
     async with httpx.AsyncClient(
         headers={"User-Agent": "zp_light_bot/2.0 (+https://github.com/fan-world-me/zp_light_bot)"},
-        timeout=20,
+        timeout=httpx.Timeout(8.0, connect=4.0),
     ) as client:
         resp = await client.get(URL)
         resp.raise_for_status()
@@ -147,10 +143,14 @@ async def fetch() -> tuple[Schedule | None, Schedule | None]:
 
     updated = _updated_label(fact, payload)
     today_ts, tomorrow_ts = _pick_days(data)
-    if today_ts is None:
+    if today_ts is None and tomorrow_ts is None:
         return None, None
 
-    today = _schedule_for(today_ts, data.get(str(today_ts)) or {}, updated)
+    today = (
+        _schedule_for(today_ts, data.get(str(today_ts)) or {}, updated)
+        if today_ts is not None
+        else None
+    )
     tomorrow = (
         _schedule_for(tomorrow_ts, data.get(str(tomorrow_ts)) or {}, updated)
         if tomorrow_ts is not None
