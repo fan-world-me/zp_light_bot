@@ -1,10 +1,15 @@
-"""Первинне джерело: CSV з Google Sheets проєкту svitlo.zp.ua.
+"""Єдине джерело: CSV з Google Sheets проєкту svitlo.zp.ua.
 
 svitlo.zp.ua — волонтерський моніторинг Запоріжжя. Свій пайплайн пише розклад
 ПАТ «Запоріжжяобленерго» у дві публічні Google-таблиці (авто-парсер і
 «напівавто» з перевіркою людини) — по одному рядку на день, включно із завтрашнім.
-CSV публічний (export?format=csv), доступний з будь-якого регіону; на випадок
-блоків є Cloudflare Worker-проксі того ж сайту.
+
+Таблиця містить історію за багато днів, тому качаємо не весь CSV, а лише рядки
+на сьогодні/завтра через gviz-запит (відповідь ~5 КБ замість всієї історії).
+Порядок джерел (наступне — лише якщо попереднє впало або не віддало рядків):
+  1. авто-таблиця (gviz, лише потрібні дати);
+  2. напівавто-таблиця (gviz, лише потрібні дати);
+  3. Cloudflare Worker-проксі того ж сайту (повний CSV авто-таблиці).
 
 Стовпці: date, time, date_information_update, source, raw_data, raw_data_json
 raw_data_json: {"date":"15.11.2026","updated_time":"17:37",
@@ -12,15 +17,16 @@ raw_data_json: {"date":"15.11.2026","updated_time":"17:37",
                 "schedule":[{"subqueue":"2.1",
                              "intervals":[{"start":"15:30","end":"18:00"}, ...]}]}
 """
-import asyncio
 import csv
 import io
 import json
 import logging
 import re
+import time
+import urllib.parse
 from datetime import datetime, timedelta
 
-import httpx
+import aiohttp
 
 from app.parser.base import TZ, Schedule, title_for
 
@@ -31,17 +37,48 @@ SHEET_ID_SEMI_AUTO = "1IPXo_cCgySsmSpEojsz04Fb_J8o8HeRKVtybDvphzG0"
 GID                = "0"
 WORKER_URL         = "https://svitlo-proxy.uaprof.workers.dev"
 
+_USER_AGENT = "zp_light_bot/2.1 (+https://github.com/fan-world-me/zp_light_bot)"
+
 _GROUP_LINE_RE = re.compile(r"(\d\.\d)\s*:")
 _INTERVAL_RE   = re.compile(r"(\d{1,2}:\d{2})\s*[–\-]\s*(\d{1,2}:\d{2})", re.U)
 
+# Один HTTP-клієнт на весь застосунок (а не новий на кожне оновлення)
+_session: aiohttp.ClientSession | None = None
 
-def _csv_urls(sheet_id: str) -> list[str]:
-    ts = int(datetime.now().timestamp() * 1000)
-    google = (
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}"
-        f"/export?format=csv&gid={GID}&t={ts}"
+
+def _get_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession(
+            headers={"User-Agent": _USER_AGENT},
+            timeout=aiohttp.ClientTimeout(total=6, connect=3),
+            connector=aiohttp.TCPConnector(limit=4),
+        )
+    return _session
+
+
+async def close() -> None:
+    """Закрити HTTP-клієнт (на shutdown)."""
+    if _session is not None and not _session.closed:
+        await _session.close()
+
+
+def _gviz_url(sheet_id: str, dates: tuple[str, ...]) -> str:
+    """CSV лише з рядками потрібних дат. Колонка A = date."""
+    cond = " or ".join(f"A contains '{d}'" for d in dates)
+    query = urllib.parse.quote(f"select * where {cond}")
+    return (
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq"
+        f"?tqx=out:csv&gid={GID}&headers=1&tq={query}&t={int(time.time())}"
     )
-    return [google, f"{WORKER_URL}?sheetId={sheet_id}&gid={GID}"]
+
+
+def _candidate_urls(dates: tuple[str, ...]) -> list[str]:
+    return [
+        _gviz_url(SHEET_ID_AUTO, dates),
+        _gviz_url(SHEET_ID_SEMI_AUTO, dates),
+        f"{WORKER_URL}?sheetId={SHEET_ID_AUTO}&gid={GID}",
+    ]
 
 
 def _hhmm(value: str | None) -> int:
@@ -59,8 +96,7 @@ def _row_freshness(row: dict) -> int:
 def _fetch_rows_from_csv(csv_text: str, wanted: set[str] | None = None) -> dict[str, dict]:
     """date (dd.mm.yyyy) -> найсвіжіший рядок дня.
 
-    Таблиця містить історію за багато днів, а потрібні лише сьогодні/завтра, тому
-    словник будуємо тільки для рядків із потрібною датою (на порядок дешевше за DictReader).
+    Словник будуємо лише для рядків із потрібною датою (дешевше за DictReader).
     """
     rows: dict[str, dict] = {}
     reader = csv.reader(io.StringIO(csv_text))
@@ -181,56 +217,26 @@ def _rows_to_schedules(rows: dict[str, dict]) -> tuple[Schedule | None, Schedule
     return today, tomorrow
 
 
-async def _fetch_sheet(client: httpx.AsyncClient, sheet_id: str) -> str:
-    last_exc: Exception | None = None
-    for url in _csv_urls(sheet_id):
-        try:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            return resp.text
-        except Exception as e:
-            last_exc = e
-            log.warning("svitlo sheet %s via %s failed: %s: %s",
-                        sheet_id[:8], url.split("/")[2], type(e).__name__, e)
-    raise last_exc or RuntimeError("sheet fetch failed")
-
-
-def _merge_sheets(results: list[str | None]) -> dict[str, dict]:
-    """CPU-важка частина (парсинг CSV) — викликається в окремому потоці."""
-    wanted = set(_wanted_dates())
-    rows: dict[str, dict] = {}
-    for csv_text in results:
-        if not csv_text:
-            continue
-        for d, row in _fetch_rows_from_csv(csv_text, wanted).items():
-            old = rows.get(d)
-            if old is None or _row_freshness(row) >= _row_freshness(old):
-                rows[d] = row
-    return rows
+async def _get_csv(url: str) -> str:
+    async with _get_session().get(url) as resp:
+        resp.raise_for_status()
+        return await resp.text(encoding="utf-8")
 
 
 async def fetch() -> tuple[Schedule | None, Schedule | None]:
-    """(на сьогодні, на завтра). Кращий рядок із двох таблиць за свіжістю."""
-    async with httpx.AsyncClient(
-        headers={"User-Agent": "zp_light_bot/2.0 (+https://github.com/fan-world-me/zp_light_bot)"},
-        follow_redirects=True,
-        timeout=httpx.Timeout(8.0, connect=4.0),
-    ) as client:
-        results = await _gather_two(client)
-
-    rows = await asyncio.to_thread(_merge_sheets, results)
-    if not rows:
-        return None, None
-    return _rows_to_schedules(rows)
-
-
-async def _gather_two(client: httpx.AsyncClient) -> list[str | None]:
-    async def safe(sheet_id: str) -> str | None:
+    """(на сьогодні, на завтра). Джерела пробуються по черзі, до першого з рядками."""
+    dates = _wanted_dates()
+    wanted = set(dates)
+    for url in _candidate_urls(dates):
+        host = url.split("/")[2]
         try:
-            return await _fetch_sheet(client, sheet_id)
+            text = await _get_csv(url)
+            rows = _fetch_rows_from_csv(text, wanted)
+            del text
         except Exception as e:
-            log.warning("svitlo sheet %s unavailable: %s", sheet_id[:8], e)
-            return None
-
-    auto, semi = await asyncio.gather(safe(SHEET_ID_AUTO), safe(SHEET_ID_SEMI_AUTO))
-    return [auto, semi]
+            log.warning("svitlo %s failed: %s: %s", host, type(e).__name__, e)
+            continue
+        if rows:
+            return _rows_to_schedules(rows)
+        log.info("svitlo %s: no rows for %s", host, ", ".join(dates))
+    return None, None

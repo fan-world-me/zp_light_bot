@@ -1,3 +1,4 @@
+import asyncio
 import re
 import logging
 from aiogram import Router, F
@@ -12,11 +13,26 @@ from app.db.database import (
     toggle_notify_all,
     upsert_user,
 )
-from app.parser.schedule import fetch_schedules, format_schedule
+from app.parser.schedule import (
+    fetch_schedules,
+    format_schedule,
+    peek,
+    start_refresh,
+)
 from app.bot.keyboards import main_menu, settings_menu, queue_picker
 
 router = Router()
 log = logging.getLogger(__name__)
+
+# Скільки максимум чекаємо фонового оновлення, щоб надіслати свіжіші дані
+_REFRESH_WAIT = 25
+
+_ERR_FETCH = "❌ Не вдалося отримати графік. Спробуй пізніше."
+_EMPTY_TODAY = "😕 Графік на сьогодні не знайдено."
+_EMPTY_TOMORROW = (
+    "🌙 Графік на завтра ще не опублікований.\n"
+    "Оператор зазвичай публікує його ввечері."
+)
 
 
 async def _answer(cb: CallbackQuery, text: str = "") -> None:
@@ -78,8 +94,7 @@ ABOUT_TEXT = (
     '💻 <a href="https://github.com/fan-world-me">GitHub профіль</a>\n'
     '📦 <a href="https://github.com/fan-world-me/zp_light_bot">Репозиторій бота</a>\n\n'
     'Дані: <a href="https://svitlo.zp.ua/">svitlo.zp.ua</a> (графіки '
-    '<a href="https://www.zoe.com.ua/outage/">Запоріжжяобленерго</a>), резерв — '
-    '<a href="https://github.com/yaroslav2901/OE_OUTAGE_DATA">OE_OUTAGE_DATA</a>\n\n'
+    '<a href="https://www.zoe.com.ua/outage/">Запоріжжяобленерго</a>)\n\n'
     "📄 Ліцензія: GPL-3.0"
 )
 
@@ -103,6 +118,71 @@ async def _get_or_create(chat_id: int) -> dict:
         await upsert_user(chat_id, [], False)
         user = {"chat_id": chat_id, "queues": [], "notify_all": False}
     return user
+
+
+# ── графік: одразу з кешу, свіжіше — окремим повідомленням ─────────────────────────────────
+def _render(value, idx: int, queue_ids: list[str] | None, empty_text: str) -> str:
+    """idx: 0 — сьогодні, 1 — завтра."""
+    sched = value[idx]
+    return format_schedule(sched, queue_ids) if sched else empty_text
+
+
+async def _send_update(cb: CallbackQuery, text: str) -> None:
+    """Нове повідомлення (а не редагування): користувач міг уже піти в інше меню."""
+    try:
+        msg = cb.message
+        chat_id = msg.chat.id if msg is not None else cb.from_user.id
+        await cb.bot.send_message(
+            chat_id,
+            "🔄 <b>Дані оновилися</b>\n\n" + text,
+            reply_markup=main_menu(),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.warning("update message failed: %s", e)
+
+
+async def _serve_schedule(
+    cb: CallbackQuery,
+    idx: int,
+    queue_ids: list[str] | None,
+    empty_text: str,
+) -> None:
+    """Миттєво показує те, що є в кеші; оновлення йде паралельно у фоні.
+
+    Якщо після оновлення текст змінився — надсилає ще одне повідомлення.
+    Мережу чекаємо лише на холодному старті, коли кешу ще нема.
+    """
+    value, stale = peek()
+
+    if value is None:
+        try:
+            value = await fetch_schedules()
+        except Exception:
+            log.error("schedule fetch error", exc_info=True)
+            await _show(cb, _ERR_FETCH, main_menu())
+            return
+        stale = False
+
+    task = start_refresh() if stale else None  # стартує паралельно з відповіддю
+    text = _render(value, idx, queue_ids, empty_text)
+    await _show(cb, text, main_menu())
+
+    if task is None:
+        return
+    try:
+        ok = await asyncio.wait_for(asyncio.shield(task), _REFRESH_WAIT)
+    except Exception:
+        return
+    if not ok:
+        return
+    new_value, _ = peek()
+    if new_value is None:
+        return
+    new_text = _render(new_value, idx, queue_ids, empty_text)
+    if new_text != text:
+        await _send_update(cb, new_text)
 
 
 # ── /start ──────────────────────────────────────────────────────────────────────────────────
@@ -153,58 +233,16 @@ async def cb_status_my(cb: CallbackQuery) -> None:
         )
         return
 
-    try:
-        today, _ = await fetch_schedules()
-    except Exception as e:
-        log.error("status_my fetch error: %s", e, exc_info=True)
-        await _show(cb, "❌ Не вдалося отримати графік. Спробуй пізніше.", main_menu())
-        return
-
-    if not today:
-        await _show(cb, "😕 Графік на сьогодні не знайдено.", main_menu())
-        return
-
-    await _show(cb, format_schedule(today, user["queues"]), main_menu())
+    await _serve_schedule(cb, 0, user["queues"], _EMPTY_TODAY)
 
 
 @router.callback_query(F.data == "status_all")
 async def cb_status_all(cb: CallbackQuery) -> None:
     await _answer(cb)
-    try:
-        today, _ = await fetch_schedules()
-    except Exception:
-        log.error("status_all fetch error", exc_info=True)
-        await _show(cb, "❌ Не вдалося отримати графік. Спробуй пізніше.", main_menu())
-        return
-
-    if not today:
-        await _show(cb, "😕 Графік на сьогодні не знайдено.", main_menu())
-        return
-
-    await _show(cb, format_schedule(today, None), main_menu())
+    await _serve_schedule(cb, 0, None, _EMPTY_TODAY)
 
 
 # ── на завтра ──────────────────────────────────────────────────────────────────────────────────
-async def _send_tomorrow(cb: CallbackQuery, queue_ids: list[str] | None) -> None:
-    try:
-        _, tomorrow = await fetch_schedules()
-    except Exception:
-        log.error("status_tomorrow fetch error", exc_info=True)
-        await _show(cb, "❌ Не вдалося отримати графік. Спробуй пізніше.", main_menu())
-        return
-
-    if not tomorrow:
-        await _show(
-            cb,
-            "🌙 Графік на завтра ще не опублікований.\n"
-            "Оператор зазвичай публікує його ввечері.",
-            main_menu(),
-        )
-        return
-
-    await _show(cb, format_schedule(tomorrow, queue_ids), main_menu())
-
-
 @router.callback_query(F.data == "status_tomorrow")
 async def cb_status_tomorrow(cb: CallbackQuery) -> None:
     await _answer(cb)
@@ -217,7 +255,7 @@ async def cb_status_tomorrow(cb: CallbackQuery) -> None:
             main_menu(),
         )
         return
-    await _send_tomorrow(cb, user["queues"])
+    await _serve_schedule(cb, 1, user["queues"], _EMPTY_TOMORROW)
 
 
 @router.callback_query(F.data == "settings")

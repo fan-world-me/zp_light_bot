@@ -6,6 +6,9 @@
 app = 'zp-light-bot'
 primary_region = 'fra'
 
+# Страховка від OOM: при нестачі RAM процес не вбивається, а скидає сторінки у swap
+swap_size_mb = 256
+
 [build]
   dockerfile = 'Dockerfile'
 
@@ -15,6 +18,8 @@ primary_region = 'fra'
 [env]
   DB_PATH = '/data/bot.db'
   WEBHOOK_HOST = 'https://zp-light-bot.fly.dev'
+  # glibc створює окрему арену пам'яті на потік (to_thread/aiosqlite) і роздуває RSS
+  MALLOC_ARENA_MAX = '2'
 
 [[mounts]]
   source = 'zp_bot_data'

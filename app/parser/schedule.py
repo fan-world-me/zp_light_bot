@@ -1,13 +1,9 @@
-"""Фасад получения графика: svitlo.zp.ua -> OE_OUTAGE_DATA -> alerts.energy.
+"""Фасад отримання графіка. Єдине джерело — svitlo.zp.ua (Google Sheets, див. providers/svitlo_zp.py).
 
-Приоритет источников:
-1. svitlo.zp.ua (Google Sheets CSV) — есть сегодня И завтра, структурированный
-   raw_data_json, точное время обновления с сайта Zoe. Доступен из любого региона.
-2. OE_OUTAGE_DATA (GitHub raw JSON) — погодинные статусы, резерв.
-3. alerts.energy (HTML) — крайний случай, только сегодня.
-
-Результат кешируется (fetch_schedules), чтобы кнопки бота не дергали источники при каждом нажатии;
-планировщик вызывает её с force=True.
+Кеш у стилі stale-while-revalidate: хендлери бота не чекають на мережу, якщо в кеші
+вже є дані. Оновлення йде у фоні (одне на всіх), а якщо дані змінилися — хендлер
+надсилає користувачу нове повідомлення. Планувальник викликає
+fetch_schedules(force=True) і чекає на свіжі дані.
 """
 import asyncio
 import logging
@@ -15,80 +11,96 @@ import time
 from datetime import datetime
 
 from app.parser.base import TZ, Schedule
-from app.parser.providers import alerts_energy, oe_outage, svitlo_zp
+from app.parser.providers import svitlo_zp
 
 log = logging.getLogger(__name__)
 
-# Жорсткі ліміти на джерела — щоб кнопки в боті не «думали» по хвилині
-_SVITLO_TIMEOUT = 15
-_OE_TIMEOUT = 10
-_ALERTS_TIMEOUT = 10
+Data = tuple[Schedule | None, Schedule | None]
 
-# Кеш результату: кнопки не мають щоразу качати обидві Google-таблиці
-_CACHE_TTL = 45      # сек — свіжий кеш віддаємо одразу
-_STALE_MAX = 900     # сек — якщо всі джерела впали, віддаємо старе до 15 хв
+_FETCH_TIMEOUT = 20   # сек — загальний ліміт одного оновлення (усі джерела разом)
+_CACHE_TTL = 60       # сек — свіжий кеш віддаємо без оновлення
+_STALE_MAX = 900      # сек — старіші за 15 хв дані вже не показуємо
+_RETRY_BACKOFF = 30   # сек — пауза після невдалого фонового оновлення
+
 _cache: dict = {"ts": 0.0, "value": None}
 _lock = asyncio.Lock()
+_bg: asyncio.Task | None = None
+_next_try = 0.0
 
 
-async def _fetch_uncached() -> tuple[Schedule | None, Schedule | None]:
-    """(на сегодня, на завтра). Бросает исключение, только если все источники упали."""
-    # 1) svitlo.zp.ua — самый свежий, с завтрашним днём
-    try:
-        result = await asyncio.wait_for(svitlo_zp.fetch(), _SVITLO_TIMEOUT)
-        if result and (result[0] or result[1]):
-            return result
-    except Exception as e:
-        log.warning("svitlo.zp.ua failed: %s: %s", type(e).__name__, e)
-
-    # 2) OE_OUTAGE_DATA
-    try:
-        result = await asyncio.wait_for(oe_outage.fetch(), _OE_TIMEOUT)
-    except Exception as e:
-        log.warning("OE_OUTAGE_DATA failed: %s: %s", type(e).__name__, e)
-        result = None
-
-    if result and (result[0] or result[1]):
-        return result
-
-    # 3) alerts.energy
-    log.info("Falling back to alerts.energy")
-    today = await asyncio.wait_for(alerts_energy.fetch(), _ALERTS_TIMEOUT)
-    return today, None
-
-
-async def fetch_schedules(force: bool = False) -> tuple[Schedule | None, Schedule | None]:
-    """Кешована обгортка. force=True — завжди йти в джерела (для планувальника)."""
-    def fresh() -> bool:
-        return _cache["value"] is not None and time.monotonic() - _cache["ts"] < _CACHE_TTL
-
-    if not force and fresh():
-        return _cache["value"]
-
-    # Хтось уже оновлює кеш, а в нас є хоч якісь дані — не чекаємо, віддаємо їх одразу
-    if (
-        not force
-        and _lock.locked()
-        and _cache["value"] is not None
-        and time.monotonic() - _cache["ts"] < _STALE_MAX
-    ):
-        return _cache["value"]
-
+async def _refresh() -> bool:
+    """Одне оновлення кешу (під lock). True — кеш свіжий, False — не вдалося."""
+    global _next_try
+    started = time.monotonic()
     async with _lock:
-        # поки чекали на lock, хтось інший міг уже оновити кеш
-        if not force and fresh():
-            return _cache["value"]
+        if _cache["ts"] > started:
+            return True  # поки чекали на lock, хтось інший уже оновив
         try:
-            value = await _fetch_uncached()
-        except Exception:
-            age = time.monotonic() - _cache["ts"]
-            if not force and _cache["value"] is not None and age < _STALE_MAX:
-                log.warning("All sources failed, serving stale cache (%.0fs old)", age)
-                return _cache["value"]
-            raise
+            value = await asyncio.wait_for(svitlo_zp.fetch(), _FETCH_TIMEOUT)
+        except Exception as e:
+            log.warning("Refresh failed: %s: %s", type(e).__name__, e)
+            _next_try = time.monotonic() + _RETRY_BACKOFF
+            return False
+        if not value or not (value[0] or value[1]):
+            log.warning("Refresh: no schedule rows")
+            _next_try = time.monotonic() + _RETRY_BACKOFF
+            return False
         _cache["value"] = value
         _cache["ts"] = time.monotonic()
-        return value
+        _next_try = 0.0
+        return True
+
+
+def start_refresh() -> asyncio.Task | None:
+    """Запустити фонове оновлення (одне на всіх). Повертає задачу (результат — bool).
+
+    None — якщо щойно була невдала спроба і джерела ще «відпочивають».
+    """
+    global _bg
+    if _bg is not None and not _bg.done():
+        return _bg
+    if time.monotonic() < _next_try:
+        return None
+    _bg = asyncio.create_task(_refresh())
+    return _bg
+
+
+def peek() -> tuple[Data | None, bool]:
+    """(дані з кешу, чи_застарілі). Дані None — якщо кешу нема або він надто старий."""
+    value = _cache["value"]
+    if value is None:
+        return None, True
+    age = time.monotonic() - _cache["ts"]
+    if age >= _STALE_MAX:
+        return None, True
+    return value, age >= _CACHE_TTL
+
+
+async def fetch_schedules(force: bool = False) -> Data:
+    """Дані, що чекають на мережу лише за потреби.
+
+    force=True — завжди оновити (для планувальника), кидає виняток при невдачі.
+    force=False — свіжий кеш віддає одразу; якщо оновити не вдалося, а старий кеш
+    ще придатний — віддає його.
+    """
+    if not force:
+        value, stale = peek()
+        if value is not None and not stale:
+            return value
+
+    ok = await _refresh()
+    if not ok:
+        value, _ = peek()
+        if value is not None and not force:
+            log.warning("Sources failed, serving stale cache")
+            return value
+        raise RuntimeError("schedule sources unavailable")
+    return _cache["value"]
+
+
+async def close() -> None:
+    """Звільнити мережеві ресурси (на shutdown)."""
+    await svitlo_zp.close()
 
 
 def _to_min(t: str) -> int:

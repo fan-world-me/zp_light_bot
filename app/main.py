@@ -14,6 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.bot.handlers import router
 from app.db.database import init_db
+from app.parser.schedule import close as close_parser, start_refresh
 from app.scheduler.notifier import check_and_notify
 
 logging.basicConfig(
@@ -54,6 +55,9 @@ async def lifespan(app: FastAPI):
     )
     log.info("Webhook set: %s", WEBHOOK_URL)
 
+    # Прогріваємо кеш графіка у фоні, щоб перші кнопки після рестарту відповідали одразу
+    start_refresh()
+
     scheduler.add_job(
         check_and_notify,
         trigger="interval",
@@ -77,6 +81,7 @@ async def lifespan(app: FastAPI):
     # webhook навмисно НЕ видаляємо: при рестарті/деплої нова машина ставить його сама,
     # а delete тут міг прилетіти вже після set_webhook нового інстансу
     await bot.session.close()
+    await close_parser()
     log.info("Shutdown complete")
 
 
