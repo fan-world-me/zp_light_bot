@@ -4,6 +4,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request, Response
 from aiogram import Bot, Dispatcher
@@ -17,6 +18,8 @@ from app.db.database import init_db
 from app.parser.schedule import close as close_parser, start_refresh
 from app.scheduler.notifier import check_and_notify
 
+load_dotenv()  # локально читає .env; на Northflank змінні задаються в налаштуваннях сервісу
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -25,7 +28,7 @@ log = logging.getLogger(__name__)
 
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
-WEBHOOK_HOST   = os.environ["WEBHOOK_HOST"]          # e.g. https://zp-light-bot.fly.dev
+WEBHOOK_HOST   = os.environ["WEBHOOK_HOST"]          # публічна адреса сервісу в Northflank, напр. https://p01--zp-light-bot--xxxx.code.run
 WEBHOOK_PATH   = "/webhook"
 WEBHOOK_URL    = WEBHOOK_HOST + WEBHOOK_PATH
 
